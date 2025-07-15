@@ -10,14 +10,12 @@ class MyNicheUtilsState {
 
     static isAnyNodeRunning() {
         return !!app.runningNodeId;
-    }
-
-    // ノードがユーザー入力待機状態かどうかを判定
+    }    // ノードがユーザー入力待機状態かどうかを判定
     static isNodeWaitingForInput(node) {
         // 画像が表示されており、ボタンが存在する場合は入力待機状態の可能性がある
         return node && node.imgs && node.imgs.length > 0 &&
-               node.continueButton && node.cancelButton &&
-               node.isWaitingForUserInput; // 明示的な待機フラグを使用
+            node.continueButton && node.cancelButton &&
+            node.isWaitingForUserInput; // 明示的な待機フラグを使用
     }
 }
 
@@ -38,6 +36,16 @@ function continueButtonPressed(node) {
     // ボタンが有効で、実行中またはユーザー入力待機中の場合に動作
     if (this.name !== '' && (isRunning || isWaiting)) {
         console.log(`MyNicheUtils: Continue button pressed for node ${node.id}`);
+
+        // MaskEditorの状態を確認
+        console.log(`MyNicheUtils: Current images in node: ${node.imgs ? node.imgs.length : 0}`);
+        if (node.imgs && node.imgs.length > 0) {
+            node.imgs.forEach((img, index) => {
+                console.log(`MyNicheUtils: Image ${index + 1} src: ${img.src}`);
+                console.log(`MyNicheUtils: Image ${index + 1} complete: ${img.complete}`);
+            });
+        }
+
         MyNicheUtilsMessaging.sendContinue(node.id);
 
         // 待機状態を解除
@@ -93,8 +101,8 @@ function cancelButtonPressed(node) {
 function setupButtonBehavior(button) {
     // クリック効果の制御
     Object.defineProperty(button, 'clicked', {
-        get: function() { return this._clicked; },
-        set: function(v) { this._clicked = (v && this.name !== ''); }
+        get: function () { return this._clicked; },
+        set: function (v) { this._clicked = (v && this.name !== ''); }
     });
 
     // シリアライゼーションを無効化
@@ -127,6 +135,8 @@ function displayPreviewImages(event) {
             node.imgs.forEach(img => {
                 if (img.src) {
                     img.src = ''; // 古い画像のソースをクリア
+                    img.onload = null; // イベントハンドラもクリア
+                    img.onerror = null;
                 }
             });
             node.imgs = [];
@@ -174,17 +184,37 @@ function showImages(node, urls) {
 
     console.log(`MyNicheUtils: Loading ${urls.length} new images for node ${node.id}`);
 
-    // 古い画像配列をクリア
+    // 古い画像配列を完全にクリア
+    if (node.imgs) {
+        node.imgs.forEach(img => {
+            if (img.onload) img.onload = null;
+            if (img.onerror) img.onerror = null;
+            if (img.src) img.src = '';
+        });
+    }
+    // MaskEditorのためにnode.imgsを使用
     node.imgs = [];
     let loadedCount = 0;
+
+    // カスタム描画フラグを設定（ComfyUIのデフォルト描画を制御するため）
+    node.customImageDisplay = true;
+
+    // キャンバスを一度クリアして重複描画を防ぐ
+    node.setDirtyCanvas(true, true);
 
     urls.forEach((u, index) => {
         const img = new Image();
         node.imgs.push(img);
 
+        // MaskEditorが必要とするメタデータを画像オブジェクトに追加
+        img.setAttribute('data-filename', u.filename);
+        img.setAttribute('data-subfolder', u.subfolder || '');
+        img.setAttribute('data-type', u.type || 'input');
+
         img.onload = () => {
             loadedCount++;
             console.log(`MyNicheUtils: Loaded image ${index + 1}/${urls.length} (${u.filename})`);
+            console.log(`MyNicheUtils: Image metadata - filename: ${img.getAttribute('data-filename')}, subfolder: ${img.getAttribute('data-subfolder')}, type: ${img.getAttribute('data-type')}`);
 
             if (loadedCount === urls.length) {
                 console.log("MyNicheUtils: All images loaded, updating canvas");
@@ -205,7 +235,7 @@ function showImages(node, urls) {
         // キャッシュバスターとタイムスタンプを追加
         const timestamp = Date.now();
         const cacheBuster = Math.random().toString(36).substring(2);
-        img.src = api.apiURL(`/view?filename=${encodeURIComponent(u.filename)}&type=temp&subfolder=${app.getPreviewFormatParam()}&t=${timestamp}&cb=${cacheBuster}`);
+        img.src = api.apiURL(`/view?filename=${encodeURIComponent(u.filename)}&type=${u.type || 'input'}&subfolder=${u.subfolder || ''}&t=${timestamp}&cb=${cacheBuster}`);
 
         console.log(`MyNicheUtils: Loading image ${index + 1}: ${img.src}`);
     });
@@ -240,7 +270,8 @@ function adjustNodeSize(node) {
 
 // 背景描画の追加
 function additionalDrawBackground(node, ctx) {
-    if (!node.imgs || node.imgs.length === 0) return;
+    // カスタム描画フラグが設定されている場合のみカスタム描画を実行
+    if (!node.customImageDisplay || !node.imgs || node.imgs.length === 0) return;
 
     const padding = 10;
     const maxImageHeight = 300;
@@ -251,6 +282,11 @@ function additionalDrawBackground(node, ctx) {
         const lastWidget = node.widgets[node.widgets.length - 1];
         currentY = lastWidget.last_y + 40;
     }
+
+    // 画像描画領域全体をクリア（重複描画を防ぐ）
+    const clearStartY = currentY - 10;
+    const clearHeight = node.size[1] - clearStartY;
+    ctx.clearRect(0, clearStartY, node.size[0], clearHeight);
 
     ctx.save();
 
@@ -273,8 +309,6 @@ function additionalDrawBackground(node, ctx) {
 
             // 画像を描画
             try {
-                // 画像描画前にキャンバスをクリア
-                ctx.clearRect(imgX, imgY, imgWidth, imgHeight);
                 ctx.drawImage(img, imgX, imgY, imgWidth, imgHeight);
             } catch (error) {
                 console.error("MyNicheUtils: Error drawing image:", error);
@@ -288,7 +322,7 @@ function additionalDrawBackground(node, ctx) {
             // 画像情報を表示
             ctx.fillStyle = "#ffffff";
             ctx.font = "12px Arial";
-            ctx.fillText(`Mask Preview ${i + 1} (Updated)`, imgX, imgY - 5);
+            ctx.fillText(`Mask Preview ${i + 1} (Click to edit)`, imgX, imgY - 5);
 
             currentY += imgHeight + padding;
         }
@@ -328,6 +362,30 @@ app.registerExtension({
     init() {
         // プレビューイベントリスナーを追加
         api.addEventListener("my-niche-utils-preview", displayPreviewImages);
+
+        // ComfyUI Manager関連のコンソールエラーを抑制
+        const originalConsoleError = console.error;
+        console.error = function (...args) {
+            const message = args.join(' ');
+            if (message.includes('badge_mode') && message.includes('404')) {
+                // badge_mode関連の404エラーは出力しない
+                return;
+            }
+            originalConsoleError.apply(console, args);
+        };
+
+        // ネットワークリクエストを監視してマスクアップロードを検出
+        const originalFetch = window.fetch;
+        window.fetch = function (...args) {
+            const url = args[0];
+            if (typeof url === 'string' && url.includes('/upload/mask')) {
+                console.log(`MyNicheUtils: Mask upload detected to:`, url);
+                if (args[1] && args[1].body instanceof FormData) {
+                    console.log(`MyNicheUtils: FormData detected in upload request`);
+                }
+            }
+            return originalFetch.apply(this, args);
+        };
 
         // 処理完了イベントリスナーを追加
         api.addEventListener("my-niche-utils-complete", (event) => {
@@ -377,15 +435,16 @@ app.registerExtension({
             node.imgs = [];
             node.isMyNicheUtilsNode = true;
             node.isWaitingForUserInput = false;
+            node.customImageDisplay = false; // 初期状態ではComfyUIのデフォルト描画を使用
 
             // 続行ボタンを追加（ノード参照を直接保存）
-            node.continueButton = node.addWidget("button", "", "", function() {
+            node.continueButton = node.addWidget("button", "", "", function () {
                 continueButtonPressed.call(this, node);
             });
             setupButtonBehavior(node.continueButton);
 
             // キャンセルボタンを追加（ノード参照を直接保存）
-            node.cancelButton = node.addWidget("button", "", "", function() {
+            node.cancelButton = node.addWidget("button", "", "", function () {
                 cancelButtonPressed.call(this, node);
             });
             setupButtonBehavior(node.cancelButton);
@@ -400,14 +459,28 @@ app.registerExtension({
 
             // 背景描画をオーバーライド
             const onDrawBackground = nodeType.prototype.onDrawBackground;
-            nodeType.prototype.onDrawBackground = function(ctx) {
-                if (onDrawBackground) {
-                    onDrawBackground.apply(this, arguments);
+            nodeType.prototype.onDrawBackground = function (ctx) {
+                // カスタム描画フラグが設定されている場合、ComfyUIのデフォルト背景描画をスキップ
+                if (this.customImageDisplay) {
+                    // ウィジェットなどの基本的な描画のみ実行
+                    if (onDrawBackground) {
+                        // 一時的にimgsを空にしてデフォルト画像描画を防ぐ
+                        const originalImgs = this.imgs;
+                        this.imgs = [];
+                        onDrawBackground.apply(this, arguments);
+                        this.imgs = originalImgs;
+                    }
+                    // カスタム描画を実行
+                    additionalDrawBackground(this, ctx);
+                } else {
+                    // 通常のComfyUI描画
+                    if (onDrawBackground) {
+                        onDrawBackground.apply(this, arguments);
+                    }
                 }
-                additionalDrawBackground(this, ctx);
             };            // ノードの更新処理をオーバーライド
             const update = nodeType.prototype.update;
-            nodeType.prototype.update = function() {
+            nodeType.prototype.update = function () {
                 if (update) {
                     update.apply(this, arguments);
                 }

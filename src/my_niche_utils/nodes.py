@@ -8,6 +8,9 @@ import torch
 import hashlib
 import sys
 import logging
+import zipfile
+import glob
+from collections import Counter
 
 # いるか不明。とりあえず入れておく
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))))))
@@ -365,7 +368,8 @@ class MyNicheUtilsMaskPainter:
                     {"image": ("IMAGE",),
                      "mask": ("MASK",),},
                  "optional":{
-                    "enable_preview": ("BOOLEAN", {"default": True}),},
+                    "enable_preview": ("BOOLEAN", {"default": True}),
+                    "auto_continue": ("BOOLEAN", {"default": False}),},
                  "hidden": {"unique_id": "UNIQUE_ID"},
                 }
 
@@ -382,8 +386,8 @@ class MyNicheUtilsMaskPainter:
         import time
         return str(time.time())
 
-    def mask_painter(self, image, mask, unique_id, enable_preview=True):
-        logging.info(f"MyNicheUtils: MaskPainter execution started for node {unique_id}, enable_preview={enable_preview}")
+    def mask_painter(self, image, mask, unique_id, enable_preview=True, auto_continue=False):
+        logging.info(f"MyNicheUtils: MaskPainter execution started for node {unique_id}, enable_preview={enable_preview}, auto_continue={auto_continue}")
 
         # 入力されたImageとMaskを処理
         batch_size = image.shape[0]
@@ -411,7 +415,7 @@ class MyNicheUtilsMaskPainter:
             else:
                 mask_resized = mask_resized[:batch_size]
 
-        # プレビュー用の画像を作成（チャンネルAにマスクを設定）
+        # プレビュー用の画像を作成（入力画像にマスクをアルファチャンネルとして追加）
         # 常にプレビューを表示する（enable_previewパラメータは将来の拡張用）
         if True:  # enable_preview:
             logging.info(f"MyNicheUtils: Creating preview images for node {unique_id}")
@@ -422,33 +426,38 @@ class MyNicheUtilsMaskPainter:
                 # マスクを取得（0-1の範囲）
                 alpha_mask = mask_resized[i].cpu().numpy()
 
-                # RGBA形式に変換（マスクを白色で表示）
+                # RGBA形式に変換（元画像にマスクをアルファチャンネルとして設定）
                 rgba_image = np.zeros((height, width, 4), dtype=np.float32)
 
-                # 元の画像をベースとして設定
-                rgba_image[:, :, :3] = rgb_image  # RGB
+                # 元の画像をそのまま設定
+                rgba_image[:, :, :3] = rgb_image  # RGB（元画像のまま）
 
-                # マスクが適用されている部分を白色でオーバーレイ
-                # マスクの値に応じて白色の強度を調整
-                mask_overlay = alpha_mask
-                rgba_image[:, :, 0] = rgb_image[:, :, 0] * (1 - mask_overlay) + mask_overlay  # R
-                rgba_image[:, :, 1] = rgb_image[:, :, 1] * (1 - mask_overlay) + mask_overlay  # G
-                rgba_image[:, :, 2] = rgb_image[:, :, 2] * (1 - mask_overlay) + mask_overlay  # B
-                rgba_image[:, :, 3] = 1.0  # 完全に不透明
+                # マスクをアルファチャンネルに設定
+                # MaskEditorで編集できるように、マスクをアルファチャンネルとして設定
+                # アルファチャンネル: 1.0 = 不透明（マスク対象）、0.0 = 透明（マスク対象外）
+                # ComfyUIマスク: 1.0 = マスク対象外、0.0 = マスク対象 → 反転が必要
+                rgba_image[:, :, 3] = 1.0 - alpha_mask  # Alpha（マスクを反転してアルファチャンネルに）
 
                 # PIL Imageに変換してプレビュー用に保存
                 preview_img = Image.fromarray((rgba_image * 255).astype(np.uint8), 'RGBA')
 
                 # 一時的なプレビューファイルとして保存
-                temp_dir = folder_paths.get_temp_directory()
+                input_dir = folder_paths.get_input_directory()
                 preview_filename = f"mask_preview_{unique_id}_{i}.png"
-                preview_path = os.path.join(temp_dir, preview_filename)
-                preview_img.save(preview_path)
+                preview_path = os.path.join(input_dir, preview_filename)
+
+                # アルファチャンネルを確実に保存するため、PNGInfoを使用
+                metadata = PngInfo()
+                metadata.add_text("source", "MyNicheUtilsMaskPainter")
+                metadata.add_text("unique_id", str(unique_id))
+                metadata.add_text("batch_index", str(i))
+
+                preview_img.save(preview_path, format='PNG', pnginfo=metadata)
 
                 preview_images.append({
                     "filename": preview_filename,
                     "subfolder": "",
-                    "type": "temp"
+                    "type": "input"
                 })
 
             # フロントエンドにプレビュー画像を送信
@@ -462,6 +471,21 @@ class MyNicheUtilsMaskPainter:
                 logging.info(f"MyNicheUtils: Successfully sent preview images for node {unique_id}")
             except Exception as e:
                 logging.error(f"MyNicheUtils: Failed to send preview: {e}", exc_info=True)
+
+            # auto_continueがTrueの場合は、ユーザー入力をスキップ
+            if auto_continue:
+                logging.info(f"MyNicheUtils: Auto continue enabled, skipping user input for node {unique_id}")
+                # プレビューファイルをクリーンアップ
+                try:
+                    for preview_info in preview_images:
+                        preview_path = os.path.join(input_dir, preview_info["filename"])
+                        if os.path.exists(preview_path):
+                            os.remove(preview_path)
+                except Exception as e:
+                    logging.warning(f"MyNicheUtils: Failed to cleanup preview files: {e}")
+
+                # auto_continueの場合は元のマスクをそのまま返却（反転不要）
+                return (image, mask_resized)
 
             # ユーザーからのメッセージを待機
             try:
@@ -477,25 +501,299 @@ class MyNicheUtilsMaskPainter:
                     })
                     logging.info(f"MyNicheUtils: Sent completion signal for node {unique_id}")
                 except Exception as e:
-                    logging.error(f"MyNicheUtils: Failed to send completion signal: {e}")
-
-                # メッセージが"continue"の場合は処理を続行
+                    logging.error(f"MyNicheUtils: Failed to send completion signal: {e}")                # メッセージが"continue"の場合は処理を続行
                 if message == "continue":
-                    return (image, mask_resized)
+                    # MaskEditorが編集したファイルを探して読み込む
+                    logging.info(f"MyNicheUtils: Looking for edited mask files...")
+
+                    # clipspace ディレクトリを確認
+                    input_dir = folder_paths.get_input_directory()
+                    clipspace_dir = os.path.join(input_dir, "clipspace")
+
+                    edited_mask = None
+                    if os.path.exists(clipspace_dir):
+                        # clipspace内の最新のpngファイルを探す
+                        clipspace_files = [f for f in os.listdir(clipspace_dir) if f.endswith('.png')]
+                        if clipspace_files:
+                            # 最新のファイルを取得
+                            latest_file = max(clipspace_files, key=lambda f: os.path.getmtime(os.path.join(clipspace_dir, f)))
+                            latest_file_path = os.path.join(clipspace_dir, latest_file)
+
+                            logging.info(f"MyNicheUtils: Found potential edited file: {latest_file}")
+
+                            try:
+                                # 編集されたファイルからマスクを抽出
+                                with Image.open(latest_file_path) as edited_img:
+                                    if 'A' in edited_img.getbands():
+                                        # アルファチャンネルを取得
+                                        alpha_channel = edited_img.getchannel('A')
+                                        mask_array = np.array(alpha_channel).astype(np.float32) / 255.0
+
+                                        # アルファチャンネルからComfyUIマスクへ変換
+                                        # プレビュー時に 1.0 - alpha_mask でアルファチャンネルに保存したので、
+                                        # 読み込み時は再度反転してComfyUIマスク形式に戻す
+                                        # アルファチャンネル: 1.0が不透明（編集対象）、0.0が透明（編集対象外）
+                                        # ComfyUIマスク: 1.0が編集対象外、0.0が編集対象 → 反転が必要
+                                        mask_array = 1.0 - mask_array  # アルファチャンネルを反転してComfyUIマスクに変換
+                                        mask_tensor = torch.from_numpy(mask_array).unsqueeze(0)  # [1, H, W]
+
+                                        # バッチサイズに合わせて拡張
+                                        if mask_tensor.shape[0] < batch_size:
+                                            mask_tensor = mask_tensor.repeat(batch_size, 1, 1)
+
+                                        edited_mask = mask_tensor
+                                        logging.info(f"MyNicheUtils: Successfully extracted mask from edited file: {mask_tensor.shape}")
+                                    else:
+                                        logging.warning(f"MyNicheUtils: Edited file has no alpha channel")
+                            except Exception as e:
+                                logging.error(f"MyNicheUtils: Failed to process edited file: {e}")
+
+                    if edited_mask is not None:
+                        logging.info(f"MyNicheUtils: Using edited mask from MaskEditor")
+                        # 元のプレビューファイルをクリーンアップ
+                        try:
+                            for preview_info in preview_images:
+                                preview_path = os.path.join(input_dir, preview_info["filename"])
+                                if os.path.exists(preview_path):
+                                    os.remove(preview_path)
+                        except Exception as e:
+                            logging.warning(f"MyNicheUtils: Failed to cleanup preview files: {e}")
+
+                        return (image, edited_mask)
+                    else:
+                        logging.warning(f"MyNicheUtils: No edited mask found, using original")
+                        # 元のマスクをそのまま返却
+                        return (image, mask_resized)
                 else:
                     # キャンセルまたはその他のメッセージの場合
                     logging.info(f"MyNicheUtils: Operation cancelled or other message: {message}")
+                    # 元のマスクをそのまま返却
                     return (image, mask_resized)
 
             except Exception as e:
                 logging.error(f"MyNicheUtils: Error waiting for message: {e}")
+                # エラー時も元のマスクをそのまま返却
                 return (image, mask_resized)
         else:
             # プレビューが無効の場合（現在は使用されない）
             logging.info(f"MyNicheUtils: Preview disabled for node {unique_id}, returning immediately")
 
         logging.info(f"MyNicheUtils: MaskPainter execution completed for node {unique_id}")
+        # 最後の処理でも元のマスクをそのまま返却
         return (image, mask_resized)
+
+
+class MyNicheUtilsZipLoader:
+    """
+    ZipファイルまたはディレクトリからZipファイルを読み込んで、画像リストとして出力するノード
+    """
+    def __init__(self):
+        self.last_dir_index = {}  # ディレクトリごとのインデックス管理
+        self.supported_formats = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.gif', '.webp'}
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mode": (["zip_file", "directory"],),
+                "path": ("STRING", {
+                    "multiline": False,
+                    "default": "",
+                    "tooltip": "zipファイルのパス、またはzipファイルが格納されたディレクトリのパス"
+                }),
+            },
+            "optional": {
+                "reset_index": ("BOOLEAN", {"default": False}),
+                "reset_index_to": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 9999,
+                    "step": 1,
+                    "tooltip": "reset_indexがTrueの場合の開始インデックス（0ベース）"
+                }),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            }
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, mode, path, reset_index=False, reset_index_to=0, unique_id=None):
+        if mode == "directory":
+            # ディレクトリモードの場合は常に再実行されるように時間を返す
+            import time
+            return str(time.time())
+        else:
+            # zipファイルモードの場合はファイルのハッシュを返す
+            if os.path.exists(path):
+                m = hashlib.sha256()
+                with open(path, 'rb') as f:
+                    m.update(f.read())
+                return m.digest().hex()
+            return "not_found"
+
+    RETURN_TYPES = ("IMAGE", "STRING", "INT", "INT", "INT", "STRING")
+    RETURN_NAMES = ("IMAGES", "ZIP_PATH", "IMAGE_COUNT", "CURRENT_INDEX", "TOTAL_FILES", "ZIP_FILENAME")
+    FUNCTION = "load_zip"
+    CATEGORY = "MyNicheUtils"
+
+    def load_zip(self, mode, path, reset_index=False, reset_index_to=0, unique_id=None):
+        if not path or path.strip() == "":
+            raise ValueError("パスが指定されていません")
+
+        zip_path = None
+        current_index = 0
+        total_files = 1
+
+        if mode == "zip_file":
+            # 直接zipファイル指定モード
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"指定されたzipファイルが見つかりません: {path}")
+            if not path.lower().endswith('.zip'):
+                raise ValueError(f"zipファイルではありません: {path}")
+            zip_path = path
+            current_index = 1  # 単一ファイルの場合は1/1として表示
+            total_files = 1
+
+        elif mode == "directory":
+            # ディレクトリ内zipファイル順次処理モード
+            if not os.path.isdir(path):
+                raise NotADirectoryError(f"指定されたパスがディレクトリではありません: {path}")
+
+            # ディレクトリ内のzipファイルを辞書順で取得
+            zip_pattern = os.path.join(path, "*.zip")
+            zip_files = sorted(glob.glob(zip_pattern))
+
+            if not zip_files:
+                raise FileNotFoundError(f"指定されたディレクトリにzipファイルが見つかりません: {path}")
+
+            total_files = len(zip_files)
+
+            # インデックス管理
+            if reset_index or unique_id not in self.last_dir_index:
+                # reset_index_toが範囲外の場合は0に設定
+                start_index = max(0, min(reset_index_to, total_files - 1))
+                self.last_dir_index[unique_id] = start_index
+                logging.info(f"MyNicheUtils ZipLoader: Reset index to {start_index} for node {unique_id}")
+
+            current_index = self.last_dir_index[unique_id]
+
+            # インデックスが範囲外の場合は最初に戻る
+            if current_index >= len(zip_files):
+                current_index = 0
+                self.last_dir_index[unique_id] = 0
+
+            zip_path = zip_files[current_index]
+
+            # 次回のために次のインデックスを設定
+            self.last_dir_index[unique_id] = (current_index + 1) % len(zip_files)
+
+            # UIに表示するためのインデックスは1ベース
+            display_index = current_index + 1
+
+            logging.info(f"MyNicheUtils ZipLoader: Processing {zip_path} (index {display_index}/{total_files})")
+
+        # zipファイルから画像を読み込み
+        images = self._load_images_from_zip(zip_path)
+
+        # zipファイル名を取得
+        zip_filename = os.path.basename(zip_path)
+
+        # ディレクトリモードの場合は1ベースのインデックスを返す
+        if mode == "directory":
+            return (images, zip_path, len(images), display_index, total_files, zip_filename)
+        else:
+            return (images, zip_path, len(images), current_index, total_files, zip_filename)
+
+    def _load_images_from_zip(self, zip_path):
+        """zipファイルから画像を読み込んでtensorのリストとして返す"""
+        images = []
+
+        with zipfile.ZipFile(zip_path, 'r') as zip_file:
+            # zip内のファイル一覧を取得（辞書順でソート）
+            file_list = sorted(zip_file.namelist())
+
+            for filename in file_list:
+                # ディレクトリは無視
+                if filename.endswith('/'):
+                    continue
+
+                # 拡張子チェック
+                _, ext = os.path.splitext(filename.lower())
+                if ext not in self.supported_formats:
+                    continue
+
+                try:
+                    # ファイルを読み込み
+                    with zip_file.open(filename) as img_file:
+                        img_data = img_file.read()
+
+                    # PILで画像を開く
+                    from io import BytesIO
+                    img = Image.open(BytesIO(img_data))
+
+                    # EXIFによる回転を適用
+                    img = ImageOps.exif_transpose(img)
+
+                    # アニメーション画像対応
+                    for frame in ImageSequence.Iterator(img):
+                        # RGB変換
+                        if frame.mode == 'I':
+                            frame = frame.point(lambda i: i * (1 / 255))
+                        rgb_image = frame.convert("RGB")
+
+                        # numpyに変換してtensorに
+                        image_array = np.array(rgb_image).astype(np.float32) / 255.0
+                        image_tensor = torch.from_numpy(image_array)[None,]  # [1, H, W, C]
+                        images.append(image_tensor)
+
+                        # アニメーション画像の場合は最初のフレームのみ
+                        if img.format not in ['GIF']:
+                            break
+
+                except Exception as e:
+                    logging.warning(f"MyNicheUtils ZipLoader: Failed to load image {filename}: {e}")
+                    continue
+
+        if not images:
+            logging.warning(f"MyNicheUtils ZipLoader: No valid images found in {zip_path}")
+            # 空の画像を返す（エラーを避けるため）
+            empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            return empty_image
+
+        # すべての画像を結合
+        if len(images) == 1:
+            return images[0]
+        else:
+            # バッチとして結合
+            return torch.cat(images, dim=0)
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, **inputs):
+        mode = inputs.get("mode")
+        path = inputs.get("path")
+
+        if not path or path.strip() == "":
+            return "パスが指定されていません"
+
+        if mode == "zip_file":
+            if not os.path.exists(path):
+                return f"指定されたzipファイルが見つかりません: {path}"
+            if not path.lower().endswith('.zip'):
+                return f"zipファイルではありません: {path}"
+        elif mode == "directory":
+            if not os.path.exists(path):
+                return f"指定されたパスが存在しません: {path}"
+            if not os.path.isdir(path):
+                return f"指定されたパスがディレクトリではありません: {path}"
+
+            # ディレクトリ内にzipファイルが存在するかチェック
+            zip_pattern = os.path.join(path, "*.zip")
+            zip_files = glob.glob(zip_pattern)
+            if not zip_files:
+                return f"指定されたディレクトリにzipファイルが見つかりません: {path}"
+
+        return True
 
 
 # A dictionary that contains all nodes you want to export with their names
@@ -506,6 +804,7 @@ NODE_CLASS_MAPPINGS = {
     "MyNicheUtilsImageBatch": MyNicheUtilsImageBatch,
     "MyNicheUtilsCounter": MyNicheUtilsCounter,
     "MyNicheUtilsMaskPainter": MyNicheUtilsMaskPainter,
+    "MyNicheUtilsZipLoader": MyNicheUtilsZipLoader,
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
@@ -515,4 +814,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MyNicheUtilsImageBatch": "ImageBatch Node",
     "MyNicheUtilsCounter": "Counter Node",
     "MyNicheUtilsMaskPainter": "MaskPainter Node",
+    "MyNicheUtilsZipLoader": "ZipLoader Node",
 }
