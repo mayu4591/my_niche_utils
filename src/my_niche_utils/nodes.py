@@ -795,6 +795,215 @@ class MyNicheUtilsZipLoader:
 
         return True
 
+class MyNicheUtilsImageLoader:
+    """
+    ディレクトリから画像ファイルを読み込んで、画像リストとして出力するノード
+    """
+    def __init__(self):
+        self.last_dir_index = {}  # ディレクトリごとのインデックス管理
+        self.supported_formats = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.gif', '.webp'}
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mode": (["directory", "parent_directory"],),
+                "path": ("STRING", {
+                    "multiline": False,
+                    "default": "",
+                    "tooltip": "画像が格納されたディレクトリのパス、または複数ディレクトリが格納された親ディレクトリのパス"
+                }),
+            },
+            "optional": {
+                "reset_index": ("BOOLEAN", {"default": False}),
+                "reset_index_to": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 9999,
+                    "step": 1,
+                    "tooltip": "reset_indexがTrueの場合の開始インデックス（0ベース）"
+                }),
+                "recursive": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "directoryモードでサブディレクトリも再帰的に検索するかどうか"
+                }),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            }
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, mode, path, reset_index=False, reset_index_to=0, recursive=False, unique_id=None):
+        # ディレクトリ内の画像ファイル数や更新時刻が変わった場合に再実行されるように時間を返す
+        import time
+        return str(time.time())
+
+    RETURN_TYPES = ("IMAGE", "STRING", "INT", "INT", "INT", "STRING")
+    RETURN_NAMES = ("IMAGES", "DIR_PATH", "IMAGE_COUNT", "CURRENT_INDEX", "TOTAL_DIRS", "DIR_NAME")
+    FUNCTION = "load_images"
+    CATEGORY = "MyNicheUtils"
+
+    def load_images(self, mode, path, reset_index=False, reset_index_to=0, recursive=False, unique_id=None):
+        if not path or path.strip() == "":
+            raise ValueError("パスが指定されていません")
+
+        dir_path = None
+        current_index = 0
+        total_dirs = 1
+
+        if mode == "directory":
+            # 直接ディレクトリ指定モード
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"指定されたディレクトリが見つかりません: {path}")
+            if not os.path.isdir(path):
+                raise NotADirectoryError(f"指定されたパスがディレクトリではありません: {path}")
+
+            dir_path = path
+            current_index = 1  # 単一ディレクトリの場合は1/1として表示
+            total_dirs = 1
+
+        elif mode == "parent_directory":
+            # 親ディレクトリ内のサブディレクトリを順次処理モード
+            if not os.path.isdir(path):
+                raise NotADirectoryError(f"指定されたパスがディレクトリではありません: {path}")
+
+            # 親ディレクトリ内のサブディレクトリを辞書順で取得
+            subdirs = [d for d in os.listdir(path)
+                      if os.path.isdir(os.path.join(path, d)) and not d.startswith('.')
+                      and not d == "clipspace"]  # clipspaceは除外
+            subdirs = sorted(subdirs)
+
+            if not subdirs:
+                raise FileNotFoundError(f"指定されたディレクトリにサブディレクトリが見つかりません: {path}")
+
+            total_dirs = len(subdirs)
+
+            # インデックス管理
+            if reset_index or unique_id not in self.last_dir_index:
+                # reset_index_toが範囲外の場合は0に設定
+                start_index = max(0, min(reset_index_to, total_dirs - 1))
+                self.last_dir_index[unique_id] = start_index
+                logging.info(f"MyNicheUtils ImageLoader: Reset index to {start_index} for node {unique_id}")
+
+            current_index = self.last_dir_index[unique_id]
+
+            # インデックスが範囲外の場合は最初に戻る
+            if current_index >= len(subdirs):
+                current_index = 0
+                self.last_dir_index[unique_id] = 0
+
+            dir_path = os.path.join(path, subdirs[current_index])
+
+            # 次回のために次のインデックスを設定
+            self.last_dir_index[unique_id] = (current_index + 1) % len(subdirs)
+
+            # UIに表示するためのインデックスは1ベース
+            display_index = current_index + 1
+
+            logging.info(f"MyNicheUtils ImageLoader: Processing {dir_path} (index {display_index}/{total_dirs})")
+
+        # ディレクトリから画像を読み込み
+        images = self._load_images_from_directory(dir_path, recursive)
+
+        # ディレクトリ名を取得
+        dir_name = os.path.basename(dir_path)
+
+        # parent_directoryモードの場合は1ベースのインデックスを返す
+        if mode == "parent_directory":
+            return (images, dir_path, len(images), display_index, total_dirs, dir_name)
+        else:
+            return (images, dir_path, len(images), current_index, total_dirs, dir_name)
+
+    def _load_images_from_directory(self, dir_path, recursive=False):
+        """ディレクトリから画像を読み込んでtensorのリストとして返す"""
+        images = []
+        image_files = []
+
+        if recursive:
+            # 再帰的に画像ファイルを取得
+            for root, dirs, files in os.walk(dir_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    _, ext = os.path.splitext(file.lower())
+                    if ext in self.supported_formats:
+                        image_files.append(file_path)
+        else:
+            # 直接の子ファイルのみ取得
+            for file in os.listdir(dir_path):
+                file_path = os.path.join(dir_path, file)
+                if os.path.isfile(file_path):
+                    _, ext = os.path.splitext(file.lower())
+                    if ext in self.supported_formats:
+                        image_files.append(file_path)
+
+        # ファイルパスでソート
+        image_files = sorted(image_files)
+
+        for file_path in image_files:
+            try:
+                # PILで画像を開く
+                img = Image.open(file_path)
+
+                # EXIFによる回転を適用
+                img = ImageOps.exif_transpose(img)
+
+                # アニメーション画像対応
+                for frame in ImageSequence.Iterator(img):
+                    # RGB変換
+                    if frame.mode == 'I':
+                        frame = frame.point(lambda i: i * (1 / 255))
+                    rgb_image = frame.convert("RGB")
+
+                    # numpyに変換してtensorに
+                    image_array = np.array(rgb_image).astype(np.float32) / 255.0
+                    image_tensor = torch.from_numpy(image_array)[None,]  # [1, H, W, C]
+                    images.append(image_tensor)
+
+                    # アニメーション画像の場合は最初のフレームのみ
+                    if img.format not in ['GIF']:
+                        break
+
+            except Exception as e:
+                logging.warning(f"MyNicheUtils ImageLoader: Failed to load image {file_path}: {e}")
+                continue
+
+        if not images:
+            logging.warning(f"MyNicheUtils ImageLoader: No valid images found in {dir_path}")
+            # 空の画像を返す（エラーを避けるため）
+            empty_image = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            return empty_image
+
+        # すべての画像を結合
+        if len(images) == 1:
+            return images[0]
+        else:
+            # バッチとして結合
+            return torch.cat(images, dim=0)
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, **inputs):
+        mode = inputs.get("mode")
+        path = inputs.get("path")
+
+        if not path or path.strip() == "":
+            return "パスが指定されていません"
+
+        if not os.path.exists(path):
+            return f"指定されたパスが存在しません: {path}"
+
+        if not os.path.isdir(path):
+            return f"指定されたパスがディレクトリではありません: {path}"
+
+        if mode == "parent_directory":
+            # 親ディレクトリ内にサブディレクトリが存在するかチェック
+            subdirs = [d for d in os.listdir(path)
+                      if os.path.isdir(os.path.join(path, d)) and not d.startswith('.')]
+            if not subdirs:
+                return f"指定されたディレクトリにサブディレクトリが見つかりません: {path}"
+
+        return True
+
 
 # A dictionary that contains all nodes you want to export with their names
 # NOTE: names should be globally unique
@@ -805,6 +1014,7 @@ NODE_CLASS_MAPPINGS = {
     "MyNicheUtilsCounter": MyNicheUtilsCounter,
     "MyNicheUtilsMaskPainter": MyNicheUtilsMaskPainter,
     "MyNicheUtilsZipLoader": MyNicheUtilsZipLoader,
+    "MyNicheUtilsImageLoader": MyNicheUtilsImageLoader,
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
@@ -815,4 +1025,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MyNicheUtilsCounter": "Counter Node",
     "MyNicheUtilsMaskPainter": "MaskPainter Node",
     "MyNicheUtilsZipLoader": "ZipLoader Node",
+    "MyNicheUtilsImageLoader": "ImageLoader Node",
 }
