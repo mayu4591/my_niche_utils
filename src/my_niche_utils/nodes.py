@@ -18,9 +18,30 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
 import folder_paths
 import node_helpers
 
-from nodes import ImageBatch
+# IO.ANY型を使用するためのインポート
+try:
+    from comfy.comfy_types.node_typing import IO
+except ImportError:
+    # フォールバック: IO.ANYが使えない場合
+    class IO:
+        ANY = "*"
+
+from nodes import ImageBatch, NODE_CLASS_MAPPINGS as ALL_NODE_CLASS_MAPPINGS
 from server import PromptServer
 import time
+
+# GraphBuilder用のインポート（loop-imageスタイルのループ制御に必要）
+try:
+    from comfy_execution.graph_utils import GraphBuilder, is_link
+    GRAPH_BUILDER_AVAILABLE = True
+except ImportError:
+    logging.warning("MyNicheUtils: GraphBuilder not available, using simplified loop implementation")
+    GRAPH_BUILDER_AVAILABLE = False
+    # フォールバック用の定義
+    def is_link(obj):
+        return False
+    class GraphBuilder:
+        pass
 
 # メッセージホルダークラス（cg-image-pickerから参考）
 class MessageHolder:
@@ -747,7 +768,7 @@ class MyNicheUtilsZipLoader:
                         image_tensor = torch.from_numpy(image_array)[None,]  # [1, H, W, C]
                         images.append(image_tensor)
 
-                        # アニメーション画像の場合は最初のフレームのみ
+                        # アニメーション画像の場合は最初のレームのみ
                         if img.format not in ['GIF']:
                             break
 
@@ -774,24 +795,24 @@ class MyNicheUtilsZipLoader:
         path = inputs.get("path")
 
         if not path or path.strip() == "":
-            return "パスが指定されていません"
+            return {"path": "パスが指定されていません"}
 
         if mode == "zip_file":
             if not os.path.exists(path):
-                return f"指定されたzipファイルが見つかりません: {path}"
+                return {"path": f"指定されたzipファイルが見つかりません: {path}"}
             if not path.lower().endswith('.zip'):
-                return f"zipファイルではありません: {path}"
+                return {"path": f"zipファイルではありません: {path}"}
         elif mode == "directory":
             if not os.path.exists(path):
-                return f"指定されたパスが存在しません: {path}"
+                return {"path": f"指定されたパスが存在しません: {path}"}
             if not os.path.isdir(path):
-                return f"指定されたパスがディレクトリではありません: {path}"
+                return {"path": f"指定されたパスがディレクトリではありません: {path}"}
 
             # ディレクトリ内にzipファイルが存在するかチェック
             zip_pattern = os.path.join(path, "*.zip")
             zip_files = glob.glob(zip_pattern)
             if not zip_files:
-                return f"指定されたディレクトリにzipファイルが見つかりません: {path}"
+                return {"path": f"指定されたディレクトリにzipファイルが見つかりません: {path}"}
 
         return True
 
@@ -986,23 +1007,418 @@ class MyNicheUtilsImageLoader:
         mode = inputs.get("mode")
         path = inputs.get("path")
 
+        # pathが空の場合のみエラー
         if not path or path.strip() == "":
-            return "パスが指定されていません"
+            return {"path": "パスが指定されていません"}
 
+        # パスが存在しない場合
         if not os.path.exists(path):
-            return f"指定されたパスが存在しません: {path}"
+            return {"path": f"指定されたパスが存在しません: {path}"}
 
+        # ディレクトリでない場合
         if not os.path.isdir(path):
-            return f"指定されたパスがディレクトリではありません: {path}"
+            return {"path": f"指定されたパスがディレクトリではありません: {path}"}
 
+        # parent_directoryモードの場合のサブディレクトリチェック
         if mode == "parent_directory":
             # 親ディレクトリ内にサブディレクトリが存在するかチェック
             subdirs = [d for d in os.listdir(path)
                       if os.path.isdir(os.path.join(path, d)) and not d.startswith('.')]
             if not subdirs:
-                return f"指定されたディレクトリにサブディレクトリが見つかりません: {path}"
+                return {"path": f"指定されたディレクトリにサブディレクトリが見つかりません: {path}"}
 
         return True
+
+
+class MyNicheUtilsLoopOpen:
+    """
+    ループ処理の開始を定義するノード（loop-imageのSingle Image Loop Openスタイル）
+    GraphBuilderを使用して動的にループ制御を行う
+    """
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "max_iterations": ("INT", {
+                    "default": 5,
+                    "min": 1,
+                    "max": 1000,
+                    "step": 1,
+                    "tooltip": "最大ループ回数"
+                }),
+                "inputcount": ("INT", {
+                    "default": 2,
+                    "min": 1,
+                    "max": 20,
+                    "step": 1,
+                    "tooltip": "入力/出力の数"
+                }),
+            },
+            "optional": {
+                "value_1": (IO.ANY, {"tooltip": "ループさせる値1"}),
+                "value_2": (IO.ANY, {"tooltip": "ループさせる値2"}),
+            },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "iteration_count": ("INT", {"default": 0}),
+                "previous_value_1": (IO.ANY,),
+                "previous_value_2": (IO.ANY,),
+                "previous_value_3": (IO.ANY,),
+                "previous_value_4": (IO.ANY,),
+                "previous_value_5": (IO.ANY,),
+                "previous_value_6": (IO.ANY,),
+                "previous_value_7": (IO.ANY,),
+                "previous_value_8": (IO.ANY,),
+                "previous_value_9": (IO.ANY,),
+                "previous_value_10": (IO.ANY,),
+                "previous_value_11": (IO.ANY,),
+                "previous_value_12": (IO.ANY,),
+                "previous_value_13": (IO.ANY,),
+                "previous_value_14": (IO.ANY,),
+                "previous_value_15": (IO.ANY,),
+                "previous_value_16": (IO.ANY,),
+                "previous_value_17": (IO.ANY,),
+                "previous_value_18": (IO.ANY,),
+                "previous_value_19": (IO.ANY,),
+                "previous_value_20": (IO.ANY,),
+            }
+        }
+
+    RETURN_TYPES = ("FLOW_CONTROL", "INT", "INT", IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY)
+    RETURN_NAMES = ("FLOW_CONTROL", "max_iterations", "iteration_count", "current_value_1", "current_value_2", "current_value_3", "current_value_4", "current_value_5", "current_value_6", "current_value_7", "current_value_8", "current_value_9", "current_value_10", "current_value_11", "current_value_12", "current_value_13", "current_value_14", "current_value_15", "current_value_16", "current_value_17", "current_value_18", "current_value_19", "current_value_20")
+    FUNCTION = "loop_open"
+    CATEGORY = "MyNicheUtils"
+    DESCRIPTION = """
+Creates a loop that iterates through values.
+You can set how many inputs the node has,
+with the **inputcount** and clicking update.
+"""
+
+    def loop_open(self, max_iterations, inputcount=1, unique_id=None, iteration_count=0, **kwargs):
+        logging.info(f"MyNicheUtils LoopOpen: Processing iteration {iteration_count}/{max_iterations} for node {unique_id}")
+        logging.info(f"MyNicheUtils LoopOpen: max_iterations type={type(max_iterations)}, value={max_iterations}")
+        logging.info(f"MyNicheUtils LoopOpen: iteration_count type={type(iteration_count)}, value={iteration_count}")
+        logging.info(f"MyNicheUtils LoopOpen: kwargs keys={list(kwargs.keys())}")
+
+        # 現在の値を取得（バッチや配列はそのまま渡す）
+        current_values = []
+        for i in range(1, inputcount + 1):
+            input_val = kwargs.get(f"value_{i}")
+            prev_val = kwargs.get(f"previous_value_{i}")
+
+            # 前回のループ結果があれば使用、なければ初期値を使用
+            if iteration_count > 0 and prev_val is not None:
+                current_val = prev_val
+            else:
+                current_val = input_val
+
+            # バッチや配列データをそのまま渡す（インデックス分割は行わない）
+            current_values.append(current_val)
+
+        # 残りの値をNoneで埋める（最大20個まで）
+        while len(current_values) < 20:
+            current_values.append(None)
+
+        # RETURN_TYPESの順序に合わせて戻り値を構築
+        # ("FLOW_CONTROL", "INT", "INT", IO.ANY * 20)
+        output_values = ["stub"] + [max_iterations, iteration_count] + current_values[:20]
+
+        logging.info(f"MyNicheUtils LoopOpen: Outputting max_iterations={max_iterations}, iteration_count={iteration_count}")
+        logging.info(f"MyNicheUtils LoopOpen: Output values count={len(output_values)}")
+        logging.info(f"MyNicheUtils LoopOpen: Output values: max_iterations={output_values[1]}, iteration_count={output_values[2]}")
+
+        return tuple(output_values)
+
+
+class MyNicheUtilsLoopClose:
+    """
+    ループ処理の終了を定義するノード（loop-imageのSingle Image Loop Closeスタイル）
+    GraphBuilderを使用して動的にループ制御を行う
+    """
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "flow_control": ("FLOW_CONTROL", {"rawLink": True}),
+                "max_iterations": ("INT", {"forceInput": True}),
+                "iteration_count": ("INT", {"forceInput": True}),
+                "inputcount": ("INT", {
+                    "default": 2,
+                    "min": 1,
+                    "max": 20,
+                    "step": 1,
+                    "tooltip": "入力/出力の数"
+                }),
+            },
+            "optional": {
+                "current_value_1": (IO.ANY, {"tooltip": "現在の値1"}),
+                "current_value_2": (IO.ANY, {"tooltip": "現在の値2"}),
+            },
+            "hidden": {
+                "dynprompt": "DYNPROMPT",
+                "unique_id": "UNIQUE_ID",
+            }
+        }
+
+    RETURN_TYPES = (IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY)
+    RETURN_NAMES = ("final_value_1", "final_value_2", "final_value_3", "final_value_4", "final_value_5", "final_value_6", "final_value_7", "final_value_8", "final_value_9", "final_value_10", "final_value_11", "final_value_12", "final_value_13", "final_value_14", "final_value_15", "final_value_16", "final_value_17", "final_value_18", "final_value_19", "final_value_20")
+    FUNCTION = "loop_close"
+    CATEGORY = "MyNicheUtils"
+    DESCRIPTION = """
+Closes the loop and returns only the final values.
+You can set how many inputs the node has,
+with the **inputcount** and clicking update.
+"""
+
+    def explore_dependencies(self, node_id, dynprompt, upstream, parent_ids):
+        """依存関係を探索する"""
+        node_info = dynprompt.get_node(node_id)
+        if "inputs" not in node_info:
+            return
+
+        for k, v in node_info["inputs"].items():
+            if is_link(v):
+                parent_id = v[0]
+                display_id = dynprompt.get_display_node_id(parent_id)
+                display_node = dynprompt.get_node(display_id)
+                class_type = display_node["class_type"]
+                if class_type not in ['MyNicheUtilsLoopClose']:
+                    parent_ids.append(display_id)
+                if parent_id not in upstream:
+                    upstream[parent_id] = []
+                    self.explore_dependencies(parent_id, dynprompt, upstream, parent_ids)
+                upstream[parent_id].append(node_id)
+
+    def explore_output_nodes(self, dynprompt, upstream, output_nodes, parent_ids):
+        """出力ノードを探索する"""
+        for parent_id in upstream:
+            display_id = dynprompt.get_display_node_id(parent_id)
+            for output_id in output_nodes:
+                id = output_nodes[output_id][0]
+                if id in parent_ids and display_id == id and output_id not in upstream[parent_id]:
+                    if '.' in parent_id:
+                        arr = parent_id.split('.')
+                        arr[len(arr)-1] = output_id
+                        upstream[parent_id].append('.'.join(arr))
+                    else:
+                        upstream[parent_id].append(output_id)
+
+    def collect_contained(self, node_id, upstream, contained):
+        """ループ内のノードを収集する"""
+        if node_id not in upstream:
+            return
+        for child_id in upstream[node_id]:
+            if child_id not in contained:
+                contained[child_id] = True
+                self.collect_contained(child_id, upstream, contained)
+
+    def loop_close(self, flow_control, max_iterations, iteration_count, inputcount=1,
+                  dynprompt=None, unique_id=None, **kwargs):
+
+        logging.info(f"MyNicheUtils LoopClose: Received max_iterations type={type(max_iterations)}, value={max_iterations}")
+        logging.info(f"MyNicheUtils LoopClose: Received iteration_count type={type(iteration_count)}, value={iteration_count}")
+        logging.info(f"MyNicheUtils LoopClose: kwargs keys={list(kwargs.keys())}")
+
+        # max_iterationsがNoneの場合のデフォルト値を設定
+        if max_iterations is None:
+            max_iterations = 1
+            logging.warning(f"MyNicheUtils LoopClose: max_iterations is None, defaulting to 1 for node {unique_id}")
+
+        # iteration_countがNoneの場合のデフォルト値を設定
+        if iteration_count is None:
+            iteration_count = 0
+            logging.warning(f"MyNicheUtils LoopClose: iteration_count is None, defaulting to 0 for node {unique_id}")
+
+        logging.info(f"MyNicheUtils LoopClose: Iteration {iteration_count}/{max_iterations} for node {unique_id}")
+
+        # 現在の値を取得
+        current_values = []
+        for i in range(1, inputcount + 1):
+            current_val = kwargs.get(f"current_value_{i}")
+            current_values.append(current_val)
+
+        # 残りの値をNoneで埋める（最大20個まで）
+        while len(current_values) < 20:
+            current_values.append(None)
+
+        # ループ終了判定
+        if iteration_count >= max_iterations - 1:
+            logging.info(f"MyNicheUtils LoopClose: Loop finished with {iteration_count + 1} iterations")
+            # 最後のループの値のみを返す
+            return tuple(current_values[:20])
+
+        # GraphBuilderが利用できない場合は最後の値を返す
+        if not GRAPH_BUILDER_AVAILABLE:
+            logging.warning("MyNicheUtils LoopClose: GraphBuilder not available, returning current values")
+            return tuple(current_values[:20])
+
+        # 次のループを準備
+        try:
+            upstream = {}
+            parent_ids = []
+            self.explore_dependencies(unique_id, dynprompt, upstream, parent_ids)
+            parent_ids = list(set(parent_ids))
+
+            # 出力ノードを取得
+            prompts = dynprompt.get_original_prompt()
+            output_nodes = {}
+            for id in prompts:
+                node = prompts[id]
+                if "inputs" not in node:
+                    continue
+                class_type = node["class_type"]
+                if class_type in ALL_NODE_CLASS_MAPPINGS:
+                    class_def = ALL_NODE_CLASS_MAPPINGS[class_type]
+                    if hasattr(class_def, 'OUTPUT_NODE') and class_def.OUTPUT_NODE == True:
+                        for k, v in node['inputs'].items():
+                            if is_link(v):
+                                output_nodes[id] = v
+
+            # 新しいグラフを作成
+            graph = GraphBuilder()
+            self.explore_output_nodes(dynprompt, upstream, output_nodes, parent_ids)
+
+            contained = {}
+            open_node = flow_control[0]
+            self.collect_contained(open_node, upstream, contained)
+            contained[unique_id] = True
+            contained[open_node] = True
+
+            # ノードを作成
+            for node_id in contained:
+                original_node = dynprompt.get_node(node_id)
+                node = graph.node(original_node["class_type"],
+                                "Recurse" if node_id == unique_id else node_id)
+                node.set_override_display_id(node_id)
+
+            # 接続を設定
+            for node_id in contained:
+                original_node = dynprompt.get_node(node_id)
+                node = graph.lookup_node("Recurse" if node_id == unique_id else node_id)
+                for k, v in original_node["inputs"].items():
+                    if is_link(v) and v[0] in contained:
+                        parent = graph.lookup_node(v[0])
+                        node.set_input(k, parent.out(v[1]))
+                    else:
+                        node.set_input(k, v)
+
+            # パラメータを設定
+            my_clone = graph.lookup_node("Recurse")
+            my_clone.set_input("iteration_count", iteration_count + 1)
+
+            new_open = graph.lookup_node(open_node)
+            new_open.set_input("iteration_count", iteration_count + 1)
+            for i, current_val in enumerate(current_values[:inputcount]):
+                new_open.set_input(f"previous_value_{i+1}", current_val)
+
+            logging.info(f"MyNicheUtils LoopClose: Continuing to iteration {iteration_count + 1}")
+
+            return {
+                "result": tuple([my_clone.out(i) for i in range(20)]),
+                "expand": graph.finalize(),
+            }
+
+        except Exception as e:
+            logging.error(f"MyNicheUtils LoopClose: Error in loop control: {e}")
+            # エラー時は現在の値を返す
+            return tuple(current_values[:20])
+
+
+class MyNicheUtilsLoopBreak:
+    """
+    ループ処理を条件付きで中断するノード
+    条件に応じてループの継続/終了を制御する
+    """
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "condition": ("BOOLEAN", {"tooltip": "Trueの場合にループを中断"}),
+                "max_iterations": ("INT", {"tooltip": "最大ループ数", "forceInput": True}),
+                "iteration_count": ("INT", {"tooltip": "現在のループインデックス", "forceInput": True}),
+                "inputcount": ("INT", {
+                    "default": 2,
+                    "min": 1,
+                    "max": 20,
+                    "step": 1,
+                    "tooltip": "入力/出力の数"
+                }),
+            },
+            "optional": {
+                "value_1": (IO.ANY, {"tooltip": "パススルーする値1"}),
+                "value_2": (IO.ANY, {"tooltip": "パススルーする値2"}),
+                "value_3": (IO.ANY, {"tooltip": "パススルーする値3"}),
+                "value_4": (IO.ANY, {"tooltip": "パススルーする値4"}),
+                "value_5": (IO.ANY, {"tooltip": "パススルーする値5"}),
+                "value_6": (IO.ANY, {"tooltip": "パススルーする値6"}),
+                "value_7": (IO.ANY, {"tooltip": "パススルーする値7"}),
+                "value_8": (IO.ANY, {"tooltip": "パススルーする値8"}),
+                "value_9": (IO.ANY, {"tooltip": "パススルーする値9"}),
+                "value_10": (IO.ANY, {"tooltip": "パススルーする値10"}),
+                "value_11": (IO.ANY, {"tooltip": "パススルーする値11"}),
+                "value_12": (IO.ANY, {"tooltip": "パススルーする値12"}),
+                "value_13": (IO.ANY, {"tooltip": "パススルーする値13"}),
+                "value_14": (IO.ANY, {"tooltip": "パススルーする値14"}),
+                "value_15": (IO.ANY, {"tooltip": "パススルーする値15"}),
+                "value_16": (IO.ANY, {"tooltip": "パススルーする値16"}),
+                "value_17": (IO.ANY, {"tooltip": "パススルーする値17"}),
+                "value_18": (IO.ANY, {"tooltip": "パススルーする値18"}),
+                "value_19": (IO.ANY, {"tooltip": "パススルーする値19"}),
+                "value_20": (IO.ANY, {"tooltip": "パススルーする値20"}),
+            },
+        }
+
+    RETURN_TYPES = (IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, IO.ANY, "INT", "BOOLEAN")
+    RETURN_NAMES = ("value_1", "value_2", "value_3", "value_4", "value_5", "value_6", "value_7", "value_8", "value_9", "value_10", "value_11", "value_12", "value_13", "value_14", "value_15", "value_16", "value_17", "value_18", "value_19", "value_20", "effective_max_iterations", "should_break")
+    FUNCTION = "loop_break"
+    CATEGORY = "MyNicheUtils"
+    DESCRIPTION = """
+Conditionally breaks the loop based on a condition.
+You can set how many inputs the node has,
+with the **inputcount** and clicking update.
+"""
+
+    def loop_break(self, condition, max_iterations, iteration_count, inputcount=1, **kwargs):
+        logging.info(f"MyNicheUtils LoopBreak: Received max_iterations type={type(max_iterations)}, value={max_iterations}")
+        logging.info(f"MyNicheUtils LoopBreak: Received iteration_count type={type(iteration_count)}, value={iteration_count}")
+        logging.info(f"MyNicheUtils LoopBreak: kwargs keys={list(kwargs.keys())}")
+
+        # max_iterationsがNoneの場合のデフォルト値を設定
+        if max_iterations is None:
+            max_iterations = 1
+            logging.warning(f"MyNicheUtils LoopBreak: max_iterations is None, defaulting to 1")
+
+        # iteration_countがNoneの場合のデフォルト値を設定
+        if iteration_count is None:
+            iteration_count = 0
+            logging.warning(f"MyNicheUtils LoopBreak: iteration_count is None, defaulting to 0")
+
+        logging.info(f"MyNicheUtils LoopBreak: condition={condition}, iteration={iteration_count}/{max_iterations}")
+
+        # 条件がTrueの場合、現在のイテレーションで強制終了
+        should_break = condition
+        effective_max_iterations = iteration_count + 1 if should_break else max_iterations
+
+        # 値を取得
+        values = []
+        for i in range(1, inputcount + 1):
+            value = kwargs.get(f"value_{i}")
+            values.append(value)
+
+        # 残りの値をNoneで埋める（最大20個まで）
+        while len(values) < 20:
+            values.append(None)
+
+        return (*values[:20], effective_max_iterations, should_break)
 
 
 # A dictionary that contains all nodes you want to export with their names
@@ -1015,6 +1431,9 @@ NODE_CLASS_MAPPINGS = {
     "MyNicheUtilsMaskPainter": MyNicheUtilsMaskPainter,
     "MyNicheUtilsZipLoader": MyNicheUtilsZipLoader,
     "MyNicheUtilsImageLoader": MyNicheUtilsImageLoader,
+    "MyNicheUtilsLoopOpen": MyNicheUtilsLoopOpen,
+    "MyNicheUtilsLoopClose": MyNicheUtilsLoopClose,
+    "MyNicheUtilsLoopBreak": MyNicheUtilsLoopBreak,
 }
 
 # A dictionary that contains the friendly/humanly readable titles for the nodes
@@ -1026,4 +1445,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MyNicheUtilsMaskPainter": "MaskPainter Node",
     "MyNicheUtilsZipLoader": "ZipLoader Node",
     "MyNicheUtilsImageLoader": "ImageLoader Node",
+    "MyNicheUtilsLoopOpen": "Loop Open Node",
+    "MyNicheUtilsLoopClose": "Loop Close Node",
+    "MyNicheUtilsLoopBreak": "Loop Break Node",
 }
